@@ -1,0 +1,288 @@
+"""
+Scraper liviano para recuperar fichas prediales del visor del SII usando el
+endpoint JSON getPredioNacional y exportar los resultados a Excel.
+
+Modo 1: escanear un rango de manzanas/predios (por defecto Las Condes).
+Modo 2: leer una lista de ROL (manzana-predio) desde CSV/XLSX.
+
+Ejemplos
+--------
+# Escanear manzanas 1000-1100 con hasta 200 predios cada una:
+python sii_predios_las_condes.py --manzana-min 1000 --manzana-max 1100 --max-predio 200
+
+# Leer roles desde un Excel que tenga columnas "ROL" o "ROL SII":
+python sii_predios_las_condes.py --roles-file roles.xlsx --out predios_roles.xlsx
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import time
+import uuid
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+import pandas as pd
+import requests
+from requests import Response, Session
+from requests.exceptions import RequestException
+
+BASE_HOST = "https://www4.sii.cl"
+PREDIO_ENDPOINT = f"{BASE_HOST}/mapasui/services/data/mapasFacadeService/getPredioNacional"
+LANDING_PAGE = f"{BASE_HOST}/mapasui/internet/"
+DEFAULT_COMUNA_CODE = 15108  # Las Condes
+ROL_RE = re.compile(r"(?P<manzana>\d+)\s*[-/]\s*(?P<predio>\d+)")
+
+HEADERS = {
+    "Origin": BASE_HOST,
+    "Referer": LANDING_PAGE,
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/129.0.0.0 Safari/537.36"
+    ),
+    "Content-Type": "application/json",
+}
+
+
+def bootstrap_session() -> Session:
+    """Inicializa una sesion con cookies validas del visor."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.get(LANDING_PAGE, timeout=30)
+    return session
+
+
+def build_servicios(comuna_code: int) -> List[Dict]:
+    """
+    El payload exige al menos un servicio activo. Usamos los mismos aliases
+    visibles en el visor publico (predial + AH de referencia).
+    """
+    base = int(comuna_code)
+    return [
+        {"comuna": base, "layer": "sii:BR_CART_SANTIAGO_ORIENTE_WMS", "style": "PREDIOS_WMS_V0"},
+        {"comuna": base, "layer": "sii:BR_CART_AH_MUESTRAS", "style": "AH_MUESTRA"},
+    ]
+
+
+def build_payload(
+    comuna_code: int,
+    manzana: int,
+    predio: int,
+    servicios: Sequence[Dict],
+) -> Dict:
+    return {
+        "metaData": {
+            "namespace": "cl.sii.sdi.lob.bbrr.mapas.data.api.interfaces.MapasFacadeService/getPredioNacional",
+            "conversationId": "UNAUTHENTICATED-CALL",
+            "transactionId": str(uuid.uuid4()),
+            "page": None,
+        },
+        "data": {
+            "predio": {
+                "comuna": str(comuna_code),
+                "manzana": str(manzana),
+                "predio": str(predio),
+            },
+            "servicios": list(servicios),
+        },
+    }
+
+
+def fetch_predio(
+    session: Session,
+    comuna_code: int,
+    manzana: int,
+    predio: int,
+    servicios: Sequence[Dict],
+    retries: int = 3,
+    timeout: int = 45,
+    backoff: float = 1.5,
+) -> Optional[Dict]:
+    payload = build_payload(comuna_code, manzana, predio, servicios)
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            resp: Response = session.post(PREDIO_ENDPOINT, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json().get("data")
+        except RequestException as exc:
+            last_exc = exc
+            if attempt + 1 == retries:
+                break
+            time.sleep(backoff * (attempt + 1))
+    if last_exc:
+        raise RuntimeError(f"Fallo al consultar manzana={manzana} predio={predio}: {last_exc}") from last_exc
+    return None
+
+
+def normalize_rol(raw: str) -> Optional[Tuple[int, int]]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    m = ROL_RE.search(text)
+    if not m:
+        return None
+    return int(m.group("manzana")), int(m.group("predio"))
+
+
+def rows_from_roles(
+    session: Session,
+    comuna_code: int,
+    roles: Iterable[Tuple[int, int]],
+    servicios: Sequence[Dict],
+    delay: float,
+    retries: int,
+) -> Iterator[Dict]:
+    for manzana, predio in roles:
+        try:
+            data = fetch_predio(session, comuna_code, manzana, predio, servicios, retries=retries)
+        except Exception as exc:  # pragma: no cover
+            print(f"[ADVERTENCIA] Error en {manzana}-{predio}: {exc}")
+            continue
+        if not data or data.get("existePredio") != 1:
+            print(f"[INFO] Sin registro para {manzana}-{predio}")
+        else:
+            yield format_row(data)
+        time.sleep(delay)
+
+
+def rows_from_scan(
+    session: Session,
+    comuna_code: int,
+    servicios: Sequence[Dict],
+    manzana_min: int,
+    manzana_max: int,
+    max_predio: int,
+    max_gaps: int,
+    delay: float,
+    retries: int,
+) -> Iterator[Dict]:
+    for manzana in range(manzana_min, manzana_max + 1):
+        empty = 0
+        print(f"[BARRIDO] Manzana {manzana}")
+        for predio in range(1, max_predio + 1):
+            try:
+                data = fetch_predio(session, comuna_code, manzana, predio, servicios, retries=retries)
+            except Exception as exc:  # pragma: no cover
+                print(f"[ADVERTENCIA] Error en {manzana}-{predio}: {exc}")
+                break
+            if not data or data.get("existePredio") != 1:
+                empty += 1
+                if empty >= max_gaps:
+                    break
+            else:
+                empty = 0
+                yield format_row(data)
+            time.sleep(delay)
+
+
+def format_row(data: Dict) -> Dict:
+    rol = data.get("rol") or f"{data.get('manzana')}-{data.get('predio')}"
+    return {
+        "Comuna": data.get("nombreComuna") or data.get("comuna"),
+        "Rol": rol,
+        "Manzana": data.get("manzana"),
+        "Predio": data.get("predio"),
+        "Direccion": (data.get("direccion") or "").strip(),
+        "NombrePropiedad": (data.get("nombreProp") or "").strip(),
+        "Ubicacion": data.get("ubicacion"),
+        "Destino": data.get("destinoDescripcion"),
+        "AvaluoTotal": data.get("valorTotal"),
+        "AvaluoAfecto": data.get("valorAfecto"),
+        "AvaluoExento": data.get("valorExento"),
+        "SuperficieTerreno": data.get("supTerreno"),
+        "SuperficieConstruidaM2": data.get("supConsMt2"),
+        "CodigoAH": data.get("ah"),
+        "EAC": data.get("eacs"),
+        "EACAno": data.get("eacano"),
+        "Periodo": data.get("periodo"),
+    }
+
+
+def parse_roles_file(path: Path) -> List[Tuple[int, int]]:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.suffix.lower() in {".xls", ".xlsx"}:
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
+    candidates = [col for col in df.columns if "rol" in col.lower()]
+    if not candidates:
+        raise ValueError("El archivo debe contener una columna que incluya 'ROL' en su nombre.")
+    roles: List[Tuple[int, int]] = []
+    for col in candidates:
+        for value in df[col].dropna():
+            parsed = normalize_rol(str(value))
+            if parsed:
+                roles.append(parsed)
+    if not roles:
+        raise ValueError("No se pudieron interpretar roles en el archivo.")
+    return roles
+
+
+def consolidate_rows(rows: Iterable[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.drop_duplicates(subset=["Rol"]).reset_index(drop=True)
+    df = df.sort_values(by=["Manzana", "Predio", "Rol"])
+    return df
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Descarga fichas del visor SII (getPredioNacional).")
+    parser.add_argument("--comuna-codigo", type=int, default=DEFAULT_COMUNA_CODE, help="Codigo comunal SII.")
+    parser.add_argument("--roles-file", type=Path, help="CSV/XLSX con columna 'ROL' o 'ROL SII'.")
+    parser.add_argument("--manzana-min", type=int, default=200, help="Manzana inicial para barrido secuencial.")
+    parser.add_argument("--manzana-max", type=int, default=300, help="Manzana final para barrido secuencial.")
+    parser.add_argument("--max-predio", type=int, default=10000, help="Cantidad maxima de predios por manzana.")
+    parser.add_argument("--max-gaps", type=int, default=5, help="Cortes por manzana tras n vacios seguidos.")
+    parser.add_argument("--delay", type=float, default=0.2, help="Pausa entre requests (segundos).")
+    parser.add_argument("--retries", type=int, default=3, help="Reintentos HTTP por peticion.")
+    parser.add_argument("--out", type=Path, default=Path("sii_roles_las_condes.xlsx"), help="Ruta del Excel destino.")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    session = bootstrap_session()
+    servicios = build_servicios(args.comuna_codigo)
+
+    if args.roles_file:
+        roles = parse_roles_file(args.roles_file)
+        row_iter = rows_from_roles(
+            session,
+            args.comuna_codigo,
+            roles,
+            servicios,
+            delay=args.delay,
+            retries=args.retries,
+        )
+    else:
+        row_iter = rows_from_scan(
+            session,
+            args.comuna_codigo,
+            servicios,
+            manzana_min=args.manzana_min,
+            manzana_max=args.manzana_max,
+            max_predio=args.max_predio,
+            max_gaps=args.max_gaps,
+            delay=args.delay,
+            retries=args.retries,
+        )
+
+    df = consolidate_rows(list(row_iter))
+    if df.empty:
+        print("No se encontraron predios con los parametros proporcionados.")
+        return
+
+    output_path = args.out.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(output_path, index=False)
+    print(f"Excel generado: {output_path} (filas: {len(df)})")
+
+
+if __name__ == "__main__":
+    main()
